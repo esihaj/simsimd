@@ -43,6 +43,7 @@
 constexpr std::size_t default_seconds = 10;
 constexpr std::size_t default_threads = 1;
 constexpr simsimd_distance_t signaling_distance = std::numeric_limits<simsimd_distance_t>::signaling_NaN();
+constexpr std::size_t mebibyte = 1024 * 1024;
 
 /// For sub-byte data types
 /// Can be overridden at runtime via `SIMSIMD_BENCH_DENSE_DIMENSIONS` environment variable
@@ -50,6 +51,10 @@ std::size_t dense_dimensions = 1536;
 /// Has quadratic impact on the number of operations
 /// Can be overridden at runtime via `SIMSIMD_BENCH_CURVED_DIMENSIONS` environment variable
 std::size_t curved_dimensions = 8;
+/// Total payload per streaming benchmark instance.
+/// Can be overridden at runtime via `SIMSIMD_BENCH_STREAM_WORKING_SET_MIB`
+/// or `SIMSIMD_BENCH_STREAM_WORKING_SET_KIB`, but not both at once.
+std::size_t stream_working_set_bytes = 256 * mebibyte;
 
 namespace bm = benchmark;
 
@@ -77,6 +82,18 @@ template <> struct datatype_enum_to_type_gt<simsimd_datatype_u64_k> { using valu
 template <std::size_t multiple>
 constexpr std::size_t divide_round_up(std::size_t n) {
     return ((n + multiple - 1) / multiple) * multiple;
+}
+
+constexpr std::size_t next_power_of_two(std::size_t n) {
+    if (n <= 1) return 1;
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    if constexpr (sizeof(std::size_t) >= 8) n |= n >> 32;
+    return n + 1;
 }
 
 /**
@@ -324,6 +341,130 @@ void measure_dense(bm::State &state, metric_at metric, metric_at baseline, std::
     state.counters["relative_error"] = mean_relative_error;
     state.counters["bytes"] = bm::Counter(iterations * pairs[0].a.size_bytes() * 2, bm::Counter::kIsRate);
     state.counters["pairs"] = bm::Counter(iterations, bm::Counter::kIsRate);
+}
+
+/**
+ *  @brief Measures dense metric throughput while streaming through a working set much larger than the caches.
+ *  @tparam pair_at The type representing the vector pair used in the measurement.
+ *  @tparam metric_at The type of the metric function (default is void).
+ *  @param state The benchmark state object provided by Google Benchmark.
+ *  @param metric The metric function to benchmark.
+ *  @param baseline The baseline function to compare against.
+ *  @param dimensions The number of dimensions in the vectors.
+ */
+template <typename pair_at, typename metric_at = void>
+void measure_dense_stream(bm::State &state, metric_at metric, metric_at baseline, std::size_t dimensions) {
+
+    using pair_t = pair_at;
+    using vector_t = typename pair_at::vector_t;
+
+    auto call_baseline = [&](pair_t &pair) -> double {
+        simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
+        baseline(pair.a.data(), pair.b.data(), pair.a.size(), &results[0]);
+        return results[0];
+    };
+    auto call_contender = [&](pair_t &pair) -> double {
+        simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
+        metric(pair.a.data(), pair.b.data(), pair.a.size(), &results[0]);
+        return results[0];
+    };
+
+    vector_t exemplar(dimensions);
+    std::size_t bytes_per_pair = exemplar.size_bytes() * 2;
+    std::size_t pairs_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / bytes_per_pair));
+    std::vector<pair_t> pairs(pairs_count);
+    for (std::size_t i = 0; i != pairs.size(); ++i) {
+        auto &pair = pairs[i];
+        pair.a = pair.b = vector_t(dimensions);
+        pair.a.randomize(static_cast<std::uint32_t>(i));
+        pair.b.randomize(static_cast<std::uint32_t>(i) + 54321u);
+    }
+
+    std::vector<double> results_baseline(128);
+    std::vector<double> results_contender(128);
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        results_baseline[i] = call_baseline(pairs[i]);
+        results_contender[i] = call_contender(pairs[i]);
+    }
+
+    std::size_t iterations = 0;
+    for (auto _ : state) {
+        std::size_t index = iterations & (pairs_count - 1);
+        bm::DoNotOptimize((results_contender[iterations & (results_contender.size() - 1)] = call_contender(pairs[index])));
+        iterations++;
+    }
+
+    double mean_delta = 0, mean_relative_error = 0;
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        auto abs_delta = std::abs(results_contender[i] - results_baseline[i]);
+        mean_delta += abs_delta;
+        double error = abs_delta != 0 && results_baseline[i] != 0 ? abs_delta / std::abs(results_baseline[i]) : 0;
+        mean_relative_error += error;
+    }
+    mean_delta /= results_baseline.size();
+    mean_relative_error /= results_baseline.size();
+    state.counters["abs_delta"] = mean_delta;
+    state.counters["relative_error"] = mean_relative_error;
+    state.counters["bytes"] = bm::Counter(iterations * bytes_per_pair, bm::Counter::kIsRate);
+    state.counters["pairs"] = bm::Counter(iterations, bm::Counter::kIsRate);
+    state.counters["working_set"] = bm::Counter(pairs_count * bytes_per_pair);
+}
+
+template <typename pair_at, typename metric_at = void>
+void measure_dense_fixed_query(bm::State &state, metric_at metric, metric_at baseline, std::size_t dimensions) {
+
+    using pair_t = pair_at;
+    using vector_t = typename pair_at::vector_t;
+
+    auto call_baseline = [&](vector_t const &query, vector_t const &db) -> double {
+        simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
+        baseline(query.data(), db.data(), query.size(), &results[0]);
+        return results[0];
+    };
+    auto call_contender = [&](vector_t const &query, vector_t const &db) -> double {
+        simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
+        metric(query.data(), db.data(), query.size(), &results[0]);
+        return results[0];
+    };
+
+    vector_t query(dimensions);
+    query.randomize(0);
+    std::size_t db_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / query.size_bytes()));
+    std::vector<vector_t> db_vectors(db_count);
+    for (std::size_t i = 0; i != db_vectors.size(); ++i) {
+        db_vectors[i] = vector_t(dimensions);
+        db_vectors[i].randomize(static_cast<std::uint32_t>(i) + 54321u);
+    }
+
+    std::vector<double> results_baseline((std::min)(db_vectors.size(), std::size_t(128)));
+    std::vector<double> results_contender(results_baseline.size());
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        results_baseline[i] = call_baseline(query, db_vectors[i]);
+        results_contender[i] = call_contender(query, db_vectors[i]);
+    }
+
+    std::size_t iterations = 0;
+    for (auto _ : state) {
+        std::size_t index = iterations & (db_count - 1);
+        bm::DoNotOptimize((results_contender[iterations & (results_contender.size() - 1)] =
+                               call_contender(query, db_vectors[index])));
+        iterations++;
+    }
+
+    double mean_delta = 0, mean_relative_error = 0;
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        auto abs_delta = std::abs(results_contender[i] - results_baseline[i]);
+        mean_delta += abs_delta;
+        double error = abs_delta != 0 && results_baseline[i] != 0 ? abs_delta / std::abs(results_baseline[i]) : 0;
+        mean_relative_error += error;
+    }
+    mean_delta /= results_baseline.size();
+    mean_relative_error /= results_baseline.size();
+    state.counters["abs_delta"] = mean_delta;
+    state.counters["relative_error"] = mean_relative_error;
+    state.counters["bytes"] = bm::Counter(iterations * query.size_bytes() * 2, bm::Counter::kIsRate);
+    state.counters["pairs"] = bm::Counter(iterations, bm::Counter::kIsRate);
+    state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
 }
 
 /**
@@ -601,6 +742,26 @@ void dense_(std::string name, metric_at *distance_func, metric_at *baseline_func
         ->Threads(default_threads);
 }
 
+template <simsimd_datatype_t datatype_ak, typename metric_at = void>
+void dense_stream_(std::string name, metric_at *distance_func, metric_at *baseline_func) {
+    using pair_t = vectors_pair_gt<datatype_ak>;
+    std::string bench_name = name + "<" + std::to_string(dense_dimensions) + "d>";
+    bm::RegisterBenchmark(bench_name.c_str(), measure_dense_stream<pair_t, metric_at *>, distance_func, baseline_func,
+                          dense_dimensions)
+        ->MinTime(default_seconds)
+        ->Threads(default_threads);
+}
+
+template <simsimd_datatype_t datatype_ak, typename metric_at = void>
+void dense_fixed_query_(std::string name, metric_at *distance_func, metric_at *baseline_func) {
+    using pair_t = vectors_pair_gt<datatype_ak>;
+    std::string bench_name = name + "<" + std::to_string(dense_dimensions) + "d>";
+    bm::RegisterBenchmark(bench_name.c_str(), measure_dense_fixed_query<pair_t, metric_at *>, distance_func,
+                          baseline_func, dense_dimensions)
+        ->MinTime(default_seconds)
+        ->Threads(default_threads);
+}
+
 template <simsimd_datatype_t datatype_ak, typename kernel_at = void, typename l2_metric_at = void>
 void fma_(std::string name, kernel_at *kernel_func, kernel_at *baseline_func, l2_metric_at *l2_metric_func) {
     using pair_t = vectors_pair_gt<datatype_ak>;
@@ -782,6 +943,30 @@ int main(int argc, char **argv) {
             curved_dimensions = parsed_curved;
             std::printf("Overriding `curved_dimensions` to %zu from SIMSIMD_BENCH_CURVED_DIMENSIONS\n",
                         curved_dimensions);
+        }
+    }
+    char const *env_stream_working_set_mib = std::getenv("SIMSIMD_BENCH_STREAM_WORKING_SET_MIB");
+    char const *env_stream_working_set_kib = std::getenv("SIMSIMD_BENCH_STREAM_WORKING_SET_KIB");
+    if (env_stream_working_set_mib && env_stream_working_set_kib) {
+        std::fprintf(stderr,
+                     "Only one of SIMSIMD_BENCH_STREAM_WORKING_SET_MIB or "
+                     "SIMSIMD_BENCH_STREAM_WORKING_SET_KIB may be set.\n");
+        return 1;
+    }
+    if (env_stream_working_set_mib) {
+        std::size_t parsed_stream_working_set_mib = std::atoi(env_stream_working_set_mib);
+        if (parsed_stream_working_set_mib > 0) {
+            stream_working_set_bytes = parsed_stream_working_set_mib * mebibyte;
+            std::printf("Overriding `stream_working_set_bytes` to %zu MiB from SIMSIMD_BENCH_STREAM_WORKING_SET_MIB\n",
+                        parsed_stream_working_set_mib);
+        }
+    }
+    else if (env_stream_working_set_kib) {
+        std::size_t parsed_stream_working_set_kib = std::atoi(env_stream_working_set_kib);
+        if (parsed_stream_working_set_kib > 0) {
+            stream_working_set_bytes = parsed_stream_working_set_kib * 1024;
+            std::printf("Overriding `stream_working_set_bytes` to %zu KiB from SIMSIMD_BENCH_STREAM_WORKING_SET_KIB\n",
+                        parsed_stream_working_set_kib);
         }
     }
     std::printf("\n");
@@ -966,6 +1151,11 @@ int main(int argc, char **argv) {
     dense_<i8_k>("l2sq_i8_haswell", simsimd_l2sq_i8_haswell, simsimd_l2sq_i8_serial);
     dense_<i8_k>("l2_i8_haswell", simsimd_l2_i8_haswell, simsimd_l2_i8_serial);
     dense_<i8_k>("dot_i8_haswell", simsimd_dot_i8_haswell, simsimd_dot_i8_serial);
+    dense_fixed_query_<i8_k>("dot_i8_haswell_fixed_query", simsimd_dot_i8_haswell, simsimd_dot_i8_serial);
+    dense_stream_<i8_k>("cos_i8_haswell_stream", simsimd_cos_i8_haswell, simsimd_cos_i8_serial);
+    dense_stream_<i8_k>("l2sq_i8_haswell_stream", simsimd_l2sq_i8_haswell, simsimd_l2sq_i8_serial);
+    dense_stream_<i8_k>("l2_i8_haswell_stream", simsimd_l2_i8_haswell, simsimd_l2_i8_serial);
+    dense_stream_<i8_k>("dot_i8_haswell_stream", simsimd_dot_i8_haswell, simsimd_dot_i8_serial);
 
     dense_<u8_k>("cos_u8_haswell", simsimd_cos_u8_haswell, simsimd_cos_u8_serial);
     dense_<u8_k>("l2sq_u8_haswell", simsimd_l2sq_u8_haswell, simsimd_l2sq_u8_serial);
@@ -1039,6 +1229,11 @@ int main(int argc, char **argv) {
     dense_<i8_k>("l2sq_i8_ice", simsimd_l2sq_i8_ice, simsimd_l2sq_i8_serial);
     dense_<i8_k>("l2_i8_ice", simsimd_l2_i8_ice, simsimd_l2_i8_serial);
     dense_<i8_k>("dot_i8_ice", simsimd_dot_i8_ice, simsimd_dot_i8_serial);
+    dense_fixed_query_<i8_k>("dot_i8_ice_fixed_query", simsimd_dot_i8_ice, simsimd_dot_i8_serial);
+    dense_stream_<i8_k>("cos_i8_ice_stream", simsimd_cos_i8_ice, simsimd_cos_i8_serial);
+    dense_stream_<i8_k>("l2sq_i8_ice_stream", simsimd_l2sq_i8_ice, simsimd_l2sq_i8_serial);
+    dense_stream_<i8_k>("l2_i8_ice_stream", simsimd_l2_i8_ice, simsimd_l2_i8_serial);
+    dense_stream_<i8_k>("dot_i8_ice_stream", simsimd_dot_i8_ice, simsimd_dot_i8_serial);
 
     dense_<u8_k>("cos_u8_ice", simsimd_cos_u8_ice, simsimd_cos_u8_serial);
     dense_<u8_k>("l2sq_u8_ice", simsimd_l2sq_u8_ice, simsimd_l2sq_u8_serial);
@@ -1136,6 +1331,11 @@ int main(int argc, char **argv) {
     dense_<i8_k>("l2sq_i8_serial", simsimd_l2sq_i8_serial, simsimd_l2sq_i8_serial);
     dense_<i8_k>("l2_i8_serial", simsimd_l2_i8_serial, simsimd_l2_i8_serial);
     dense_<i8_k>("dot_i8_serial", simsimd_dot_i8_serial, simsimd_dot_i8_serial);
+    dense_fixed_query_<i8_k>("dot_i8_serial_fixed_query", simsimd_dot_i8_serial, simsimd_dot_i8_serial);
+    dense_stream_<i8_k>("cos_i8_serial_stream", simsimd_cos_i8_serial, simsimd_cos_i8_serial);
+    dense_stream_<i8_k>("l2sq_i8_serial_stream", simsimd_l2sq_i8_serial, simsimd_l2sq_i8_serial);
+    dense_stream_<i8_k>("l2_i8_serial_stream", simsimd_l2_i8_serial, simsimd_l2_i8_serial);
+    dense_stream_<i8_k>("dot_i8_serial_stream", simsimd_dot_i8_serial, simsimd_dot_i8_serial);
 
     dense_<u8_k>("cos_u8_serial", simsimd_cos_u8_serial, simsimd_cos_u8_serial);
     dense_<u8_k>("l2sq_u8_serial", simsimd_l2sq_u8_serial, simsimd_l2sq_u8_serial);
