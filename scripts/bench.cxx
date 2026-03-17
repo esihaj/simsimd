@@ -467,6 +467,138 @@ void measure_dense_fixed_query(bm::State &state, metric_at metric, metric_at bas
     state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
 }
 
+#if SIMSIMD_TARGET_ICE
+#pragma GCC push_options
+#pragma GCC target("avx2", "avx512f", "avx512vl", "bmi2", "avx512bw", "avx512vnni")
+#pragma clang attribute push(__attribute__((target("avx2,avx512f,avx512vl,bmi2,avx512bw,avx512vnni"))), \
+                             apply_to = function)
+
+SIMSIMD_INTERNAL __mmask64 _simsimd_bench_maskz_upto_64(simsimd_size_t count_scalars) {
+    if (!count_scalars) return 0;
+    if (count_scalars >= 64) return ~(__mmask64)0;
+    return (((__mmask64)1) << count_scalars) - 1;
+}
+
+struct fixed_query_i8_dot_i8_by_subtraction_gt {
+    simsimd_i8_t const *query_ = nullptr;
+    simsimd_size_t count_scalars_ = 0;
+    simsimd_i64_t query_offset_ = 0;
+
+    fixed_query_i8_dot_i8_by_subtraction_gt(simsimd_i8_t const *query, simsimd_size_t count_scalars) noexcept
+        : query_(query), count_scalars_(count_scalars) {
+        __m512i query_sums_i32 = _mm512_setzero_si512();
+        __m512i ones_u8 = _mm512_set1_epi8(1);
+        simsimd_i8_t const *query_head = query_;
+        simsimd_size_t remaining = count_scalars_;
+
+        while (remaining) {
+            __m512i query_i8;
+            if (remaining < 64) {
+                __mmask64 mask = _simsimd_bench_maskz_upto_64(remaining);
+                query_i8 = _mm512_maskz_loadu_epi8(mask, query_head);
+                remaining = 0;
+            }
+            else {
+                query_i8 = _mm512_loadu_si512((__m512i const *)query_head);
+                query_head += 64;
+                remaining -= 64;
+            }
+            query_sums_i32 = _mm512_dpbusd_epi32(query_sums_i32, ones_u8, query_i8);
+        }
+
+        query_offset_ = ((simsimd_i64_t)_mm512_reduce_add_epi32(query_sums_i32)) << 7;
+    }
+
+    simsimd_distance_t operator()(simsimd_u8_t const *db_shifted) const noexcept {
+        __m512i dot_i32 = _mm512_setzero_si512();
+        simsimd_i8_t const *query_head = query_;
+        simsimd_u8_t const *db_head = db_shifted;
+        simsimd_size_t remaining = count_scalars_;
+
+        while (remaining) {
+            __m512i query_i8, db_shifted_u8;
+            if (remaining < 64) {
+                __mmask64 mask = _simsimd_bench_maskz_upto_64(remaining);
+                query_i8 = _mm512_maskz_loadu_epi8(mask, query_head);
+                db_shifted_u8 = _mm512_maskz_loadu_epi8(mask, db_head);
+                remaining = 0;
+            }
+            else {
+                query_i8 = _mm512_loadu_si512((__m512i const *)query_head);
+                db_shifted_u8 = _mm512_loadu_si512((__m512i const *)db_head);
+                query_head += 64;
+                db_head += 64;
+                remaining -= 64;
+            }
+            dot_i32 = _mm512_dpbusd_epi32(dot_i32, db_shifted_u8, query_i8);
+        }
+
+        return (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot_i32) - query_offset_);
+    }
+};
+
+void measure_fixed_query_i8_dot_i8_by_subtraction(bm::State &state, decltype(&simsimd_dot_i8_serial) baseline,
+                                                  std::size_t dimensions) {
+
+    using vector_t = vector_gt<simsimd_datatype_i8_k>;
+    using shifted_vector_t = vector_gt<simsimd_datatype_u8_k>;
+
+    auto call_baseline = [&](vector_t const &query, vector_t const &db) -> double {
+        simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
+        baseline(query.data(), db.data(), query.size(), &results[0]);
+        return results[0];
+    };
+
+    vector_t query(dimensions);
+    query.randomize(0);
+    fixed_query_i8_dot_i8_by_subtraction_gt contender(query.data(), query.size());
+
+    std::size_t db_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / query.size_bytes()));
+    std::vector<vector_t> db_vectors(db_count);
+    std::vector<shifted_vector_t> db_vectors_shifted(db_count);
+    for (std::size_t i = 0; i != db_vectors.size(); ++i) {
+        db_vectors[i] = vector_t(dimensions);
+        db_vectors[i].randomize(static_cast<std::uint32_t>(i) + 54321u);
+        db_vectors_shifted[i] = shifted_vector_t(dimensions);
+        for (std::size_t j = 0; j != db_vectors[i].size_scalars(); ++j)
+            db_vectors_shifted[i].data_scalars()[j] = (simsimd_u8_t)(db_vectors[i].data_scalars()[j] ^ simsimd_i8_t(0x80));
+    }
+
+    std::vector<double> results_baseline((std::min)(db_vectors.size(), std::size_t(128)));
+    std::vector<double> results_contender(results_baseline.size());
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        results_baseline[i] = call_baseline(query, db_vectors[i]);
+        results_contender[i] = contender(db_vectors_shifted[i].data());
+    }
+
+    std::size_t iterations = 0;
+    for (auto _ : state) {
+        std::size_t index = iterations & (db_count - 1);
+        bm::DoNotOptimize((results_contender[iterations & (results_contender.size() - 1)] =
+                               contender(db_vectors_shifted[index].data())));
+        iterations++;
+    }
+
+    double mean_delta = 0, mean_relative_error = 0;
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        auto abs_delta = std::abs(results_contender[i] - results_baseline[i]);
+        mean_delta += abs_delta;
+        double error = abs_delta != 0 && results_baseline[i] != 0 ? abs_delta / std::abs(results_baseline[i]) : 0;
+        mean_relative_error += error;
+    }
+    mean_delta /= results_baseline.size();
+    mean_relative_error /= results_baseline.size();
+    state.counters["abs_delta"] = mean_delta;
+    state.counters["relative_error"] = mean_relative_error;
+    state.counters["bytes"] = bm::Counter(iterations * query.size_bytes() * 2, bm::Counter::kIsRate);
+    state.counters["pairs"] = bm::Counter(iterations, bm::Counter::kIsRate);
+    state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
+}
+
+#pragma clang attribute pop
+#pragma GCC pop_options
+#endif
+
 /**
  *  @brief Measures the performance of a @b curved metric function against a baseline using Google Benchmark.
  *  @tparam pair_at The type representing the vector pair used in the measurement.
@@ -1230,6 +1362,13 @@ int main(int argc, char **argv) {
     dense_<i8_k>("l2_i8_ice", simsimd_l2_i8_ice, simsimd_l2_i8_serial);
     dense_<i8_k>("dot_i8_ice", simsimd_dot_i8_ice, simsimd_dot_i8_serial);
     dense_fixed_query_<i8_k>("dot_i8_ice_fixed_query", simsimd_dot_i8_ice, simsimd_dot_i8_serial);
+    {
+        std::string bench_name = "fixed_query_i8_dot_i8_by_subtraction<" + std::to_string(dense_dimensions) + "d>";
+        bm::RegisterBenchmark(bench_name.c_str(), measure_fixed_query_i8_dot_i8_by_subtraction, simsimd_dot_i8_serial,
+                              dense_dimensions)
+            ->MinTime(default_seconds)
+            ->Threads(default_threads);
+    }
     dense_stream_<i8_k>("cos_i8_ice_stream", simsimd_cos_i8_ice, simsimd_cos_i8_serial);
     dense_stream_<i8_k>("l2sq_i8_ice_stream", simsimd_l2sq_i8_ice, simsimd_l2sq_i8_serial);
     dense_stream_<i8_k>("l2_i8_ice_stream", simsimd_l2_i8_ice, simsimd_l2_i8_serial);
