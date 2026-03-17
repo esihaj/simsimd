@@ -479,12 +479,13 @@ SIMSIMD_INTERNAL __mmask64 _simsimd_bench_maskz_upto_64(simsimd_size_t count_sca
     return (((__mmask64)1) << count_scalars) - 1;
 }
 
-struct fixed_query_i8_dot_i8_by_subtraction_gt {
+struct dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_gt {
     simsimd_i8_t const *query_ = nullptr;
     simsimd_size_t count_scalars_ = 0;
     simsimd_i64_t query_offset_ = 0;
 
-    fixed_query_i8_dot_i8_by_subtraction_gt(simsimd_i8_t const *query, simsimd_size_t count_scalars) noexcept
+    dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_gt(simsimd_i8_t const *query,
+                                                       simsimd_size_t count_scalars) noexcept
         : query_(query), count_scalars_(count_scalars) {
         __m512i query_sums_i32 = _mm512_setzero_si512();
         __m512i ones_u8 = _mm512_set1_epi8(1);
@@ -537,8 +538,171 @@ struct fixed_query_i8_dot_i8_by_subtraction_gt {
     }
 };
 
-void measure_fixed_query_i8_dot_i8_by_subtraction(bm::State &state, decltype(&simsimd_dot_i8_serial) baseline,
-                                                  std::size_t dimensions) {
+struct dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16_gt {
+    static constexpr std::size_t batch_size_k = 16;
+
+    simsimd_i8_t const *query_ = nullptr;
+    simsimd_size_t count_scalars_ = 0;
+    simsimd_size_t vector_stride_bytes_ = 0;
+    simsimd_i64_t query_offset_ = 0;
+
+    dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16_gt(simsimd_i8_t const *query,
+                                                                 simsimd_size_t count_scalars,
+                                                                 simsimd_size_t vector_stride_bytes) noexcept
+        : query_(query), count_scalars_(count_scalars), vector_stride_bytes_(vector_stride_bytes) {
+        __m512i query_sums_i32 = _mm512_setzero_si512();
+        __m512i ones_u8 = _mm512_set1_epi8(1);
+        simsimd_i8_t const *query_head = query_;
+        simsimd_size_t remaining = count_scalars_;
+
+        while (remaining) {
+            __m512i query_i8;
+            if (remaining < 64) {
+                __mmask64 mask = _simsimd_bench_maskz_upto_64(remaining);
+                query_i8 = _mm512_maskz_loadu_epi8(mask, query_head);
+                remaining = 0;
+            }
+            else {
+                query_i8 = _mm512_loadu_si512((__m512i const *)query_head);
+                query_head += 64;
+                remaining -= 64;
+            }
+            query_sums_i32 = _mm512_dpbusd_epi32(query_sums_i32, ones_u8, query_i8);
+        }
+
+        query_offset_ = ((simsimd_i64_t)_mm512_reduce_add_epi32(query_sums_i32)) << 7;
+    }
+
+    void operator()(simsimd_u8_t const *db_flat_batch, simsimd_distance_t *results) const noexcept {
+        __m512i dot0_i32 = _mm512_setzero_si512();
+        __m512i dot1_i32 = _mm512_setzero_si512();
+        __m512i dot2_i32 = _mm512_setzero_si512();
+        __m512i dot3_i32 = _mm512_setzero_si512();
+        __m512i dot4_i32 = _mm512_setzero_si512();
+        __m512i dot5_i32 = _mm512_setzero_si512();
+        __m512i dot6_i32 = _mm512_setzero_si512();
+        __m512i dot7_i32 = _mm512_setzero_si512();
+        __m512i dot8_i32 = _mm512_setzero_si512();
+        __m512i dot9_i32 = _mm512_setzero_si512();
+        __m512i dot10_i32 = _mm512_setzero_si512();
+        __m512i dot11_i32 = _mm512_setzero_si512();
+        __m512i dot12_i32 = _mm512_setzero_si512();
+        __m512i dot13_i32 = _mm512_setzero_si512();
+        __m512i dot14_i32 = _mm512_setzero_si512();
+        __m512i dot15_i32 = _mm512_setzero_si512();
+
+        simsimd_i8_t const *query_head = query_;
+        simsimd_u8_t const *db0_head = db_flat_batch + vector_stride_bytes_ * 0;
+        simsimd_u8_t const *db1_head = db_flat_batch + vector_stride_bytes_ * 1;
+        simsimd_u8_t const *db2_head = db_flat_batch + vector_stride_bytes_ * 2;
+        simsimd_u8_t const *db3_head = db_flat_batch + vector_stride_bytes_ * 3;
+        simsimd_u8_t const *db4_head = db_flat_batch + vector_stride_bytes_ * 4;
+        simsimd_u8_t const *db5_head = db_flat_batch + vector_stride_bytes_ * 5;
+        simsimd_u8_t const *db6_head = db_flat_batch + vector_stride_bytes_ * 6;
+        simsimd_u8_t const *db7_head = db_flat_batch + vector_stride_bytes_ * 7;
+        simsimd_u8_t const *db8_head = db_flat_batch + vector_stride_bytes_ * 8;
+        simsimd_u8_t const *db9_head = db_flat_batch + vector_stride_bytes_ * 9;
+        simsimd_u8_t const *db10_head = db_flat_batch + vector_stride_bytes_ * 10;
+        simsimd_u8_t const *db11_head = db_flat_batch + vector_stride_bytes_ * 11;
+        simsimd_u8_t const *db12_head = db_flat_batch + vector_stride_bytes_ * 12;
+        simsimd_u8_t const *db13_head = db_flat_batch + vector_stride_bytes_ * 13;
+        simsimd_u8_t const *db14_head = db_flat_batch + vector_stride_bytes_ * 14;
+        simsimd_u8_t const *db15_head = db_flat_batch + vector_stride_bytes_ * 15;
+        simsimd_size_t remaining = count_scalars_;
+
+        while (remaining) {
+            __m512i query_i8;
+            __m512i db0_u8, db1_u8, db2_u8, db3_u8, db4_u8, db5_u8, db6_u8, db7_u8;
+            __m512i db8_u8, db9_u8, db10_u8, db11_u8, db12_u8, db13_u8, db14_u8, db15_u8;
+
+            if (remaining < 64) {
+                __mmask64 mask = _simsimd_bench_maskz_upto_64(remaining);
+                query_i8 = _mm512_maskz_loadu_epi8(mask, query_head);
+                db0_u8 = _mm512_maskz_loadu_epi8(mask, db0_head);
+                db1_u8 = _mm512_maskz_loadu_epi8(mask, db1_head);
+                db2_u8 = _mm512_maskz_loadu_epi8(mask, db2_head);
+                db3_u8 = _mm512_maskz_loadu_epi8(mask, db3_head);
+                db4_u8 = _mm512_maskz_loadu_epi8(mask, db4_head);
+                db5_u8 = _mm512_maskz_loadu_epi8(mask, db5_head);
+                db6_u8 = _mm512_maskz_loadu_epi8(mask, db6_head);
+                db7_u8 = _mm512_maskz_loadu_epi8(mask, db7_head);
+                db8_u8 = _mm512_maskz_loadu_epi8(mask, db8_head);
+                db9_u8 = _mm512_maskz_loadu_epi8(mask, db9_head);
+                db10_u8 = _mm512_maskz_loadu_epi8(mask, db10_head);
+                db11_u8 = _mm512_maskz_loadu_epi8(mask, db11_head);
+                db12_u8 = _mm512_maskz_loadu_epi8(mask, db12_head);
+                db13_u8 = _mm512_maskz_loadu_epi8(mask, db13_head);
+                db14_u8 = _mm512_maskz_loadu_epi8(mask, db14_head);
+                db15_u8 = _mm512_maskz_loadu_epi8(mask, db15_head);
+                remaining = 0;
+            }
+            else {
+                query_i8 = _mm512_loadu_si512((__m512i const *)query_head);
+                db0_u8 = _mm512_loadu_si512((__m512i const *)db0_head);
+                db1_u8 = _mm512_loadu_si512((__m512i const *)db1_head);
+                db2_u8 = _mm512_loadu_si512((__m512i const *)db2_head);
+                db3_u8 = _mm512_loadu_si512((__m512i const *)db3_head);
+                db4_u8 = _mm512_loadu_si512((__m512i const *)db4_head);
+                db5_u8 = _mm512_loadu_si512((__m512i const *)db5_head);
+                db6_u8 = _mm512_loadu_si512((__m512i const *)db6_head);
+                db7_u8 = _mm512_loadu_si512((__m512i const *)db7_head);
+                db8_u8 = _mm512_loadu_si512((__m512i const *)db8_head);
+                db9_u8 = _mm512_loadu_si512((__m512i const *)db9_head);
+                db10_u8 = _mm512_loadu_si512((__m512i const *)db10_head);
+                db11_u8 = _mm512_loadu_si512((__m512i const *)db11_head);
+                db12_u8 = _mm512_loadu_si512((__m512i const *)db12_head);
+                db13_u8 = _mm512_loadu_si512((__m512i const *)db13_head);
+                db14_u8 = _mm512_loadu_si512((__m512i const *)db14_head);
+                db15_u8 = _mm512_loadu_si512((__m512i const *)db15_head);
+
+                query_head += 64;
+                db0_head += 64, db1_head += 64, db2_head += 64, db3_head += 64;
+                db4_head += 64, db5_head += 64, db6_head += 64, db7_head += 64;
+                db8_head += 64, db9_head += 64, db10_head += 64, db11_head += 64;
+                db12_head += 64, db13_head += 64, db14_head += 64, db15_head += 64;
+                remaining -= 64;
+            }
+
+            dot0_i32 = _mm512_dpbusd_epi32(dot0_i32, db0_u8, query_i8);
+            dot1_i32 = _mm512_dpbusd_epi32(dot1_i32, db1_u8, query_i8);
+            dot2_i32 = _mm512_dpbusd_epi32(dot2_i32, db2_u8, query_i8);
+            dot3_i32 = _mm512_dpbusd_epi32(dot3_i32, db3_u8, query_i8);
+            dot4_i32 = _mm512_dpbusd_epi32(dot4_i32, db4_u8, query_i8);
+            dot5_i32 = _mm512_dpbusd_epi32(dot5_i32, db5_u8, query_i8);
+            dot6_i32 = _mm512_dpbusd_epi32(dot6_i32, db6_u8, query_i8);
+            dot7_i32 = _mm512_dpbusd_epi32(dot7_i32, db7_u8, query_i8);
+            dot8_i32 = _mm512_dpbusd_epi32(dot8_i32, db8_u8, query_i8);
+            dot9_i32 = _mm512_dpbusd_epi32(dot9_i32, db9_u8, query_i8);
+            dot10_i32 = _mm512_dpbusd_epi32(dot10_i32, db10_u8, query_i8);
+            dot11_i32 = _mm512_dpbusd_epi32(dot11_i32, db11_u8, query_i8);
+            dot12_i32 = _mm512_dpbusd_epi32(dot12_i32, db12_u8, query_i8);
+            dot13_i32 = _mm512_dpbusd_epi32(dot13_i32, db13_u8, query_i8);
+            dot14_i32 = _mm512_dpbusd_epi32(dot14_i32, db14_u8, query_i8);
+            dot15_i32 = _mm512_dpbusd_epi32(dot15_i32, db15_u8, query_i8);
+        }
+
+        results[0] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot0_i32) - query_offset_);
+        results[1] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot1_i32) - query_offset_);
+        results[2] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot2_i32) - query_offset_);
+        results[3] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot3_i32) - query_offset_);
+        results[4] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot4_i32) - query_offset_);
+        results[5] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot5_i32) - query_offset_);
+        results[6] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot6_i32) - query_offset_);
+        results[7] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot7_i32) - query_offset_);
+        results[8] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot8_i32) - query_offset_);
+        results[9] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot9_i32) - query_offset_);
+        results[10] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot10_i32) - query_offset_);
+        results[11] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot11_i32) - query_offset_);
+        results[12] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot12_i32) - query_offset_);
+        results[13] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot13_i32) - query_offset_);
+        results[14] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot14_i32) - query_offset_);
+        results[15] = (simsimd_distance_t)((simsimd_i64_t)_mm512_reduce_add_epi32(dot15_i32) - query_offset_);
+    }
+};
+
+void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction(bm::State &state,
+                                                             decltype(&simsimd_dot_i8_serial) baseline,
+                                                             std::size_t dimensions) {
 
     using vector_t = vector_gt<simsimd_datatype_i8_k>;
     using shifted_vector_t = vector_gt<simsimd_datatype_u8_k>;
@@ -551,7 +715,7 @@ void measure_fixed_query_i8_dot_i8_by_subtraction(bm::State &state, decltype(&si
 
     vector_t query(dimensions);
     query.randomize(0);
-    fixed_query_i8_dot_i8_by_subtraction_gt contender(query.data(), query.size());
+    dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_gt contender(query.data(), query.size());
 
     std::size_t db_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / query.size_bytes()));
     std::vector<vector_t> db_vectors(db_count);
@@ -592,6 +756,73 @@ void measure_fixed_query_i8_dot_i8_by_subtraction(bm::State &state, decltype(&si
     state.counters["relative_error"] = mean_relative_error;
     state.counters["bytes"] = bm::Counter(iterations * query.size_bytes() * 2, bm::Counter::kIsRate);
     state.counters["pairs"] = bm::Counter(iterations, bm::Counter::kIsRate);
+    state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
+}
+
+void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16(
+    bm::State &state, decltype(&simsimd_dot_i8_serial) baseline, std::size_t dimensions) {
+
+    using vector_t = vector_gt<simsimd_datatype_i8_k>;
+
+    constexpr std::size_t batch_size = dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16_gt::batch_size_k;
+
+    auto call_baseline = [&](vector_t const &query, vector_t const &db) -> double {
+        simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
+        baseline(query.data(), db.data(), query.size(), &results[0]);
+        return results[0];
+    };
+
+    vector_t query(dimensions);
+    query.randomize(0);
+    dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16_gt contender(query.data(), query.size(),
+                                                                            query.size_bytes());
+
+    std::size_t db_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / query.size_bytes()));
+    std::vector<vector_t> db_vectors(db_count);
+    std::vector<simsimd_u8_t> flat_db(db_count * query.size_bytes());
+    for (std::size_t i = 0; i != db_vectors.size(); ++i) {
+        db_vectors[i] = vector_t(dimensions);
+        db_vectors[i].randomize(static_cast<std::uint32_t>(i) + 54321u);
+        simsimd_u8_t *flat_db_vector = flat_db.data() + i * query.size_bytes();
+        for (std::size_t j = 0; j != db_vectors[i].size_scalars(); ++j)
+            flat_db_vector[j] = (simsimd_u8_t)(db_vectors[i].data_scalars()[j] ^ simsimd_i8_t(0x80));
+        for (std::size_t j = db_vectors[i].size_scalars(); j != query.size_bytes(); ++j) flat_db_vector[j] = 0;
+    }
+
+    std::vector<double> results_baseline((std::min)(db_vectors.size(), std::size_t(128)));
+    std::vector<double> results_contender(results_baseline.size());
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) results_baseline[i] = call_baseline(query, db_vectors[i]);
+
+    for (std::size_t i = 0; i != results_contender.size(); i += batch_size) {
+        simsimd_distance_t batch_results[batch_size];
+        contender(flat_db.data() + i * query.size_bytes(), batch_results);
+        for (std::size_t lane = 0; lane != batch_size; ++lane) results_contender[i + lane] = batch_results[lane];
+    }
+
+    std::size_t iterations = 0;
+    for (auto _ : state) {
+        std::size_t base_index = (iterations * batch_size) & (db_count - 1);
+        simsimd_distance_t batch_results[batch_size];
+        contender(flat_db.data() + base_index * query.size_bytes(), batch_results);
+        for (std::size_t lane = 0; lane != batch_size; ++lane)
+            bm::DoNotOptimize((results_contender[(iterations * batch_size + lane) & (results_contender.size() - 1)] =
+                                   batch_results[lane]));
+        iterations++;
+    }
+
+    double mean_delta = 0, mean_relative_error = 0;
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        auto abs_delta = std::abs(results_contender[i] - results_baseline[i]);
+        mean_delta += abs_delta;
+        double error = abs_delta != 0 && results_baseline[i] != 0 ? abs_delta / std::abs(results_baseline[i]) : 0;
+        mean_relative_error += error;
+    }
+    mean_delta /= results_baseline.size();
+    mean_relative_error /= results_baseline.size();
+    state.counters["abs_delta"] = mean_delta;
+    state.counters["relative_error"] = mean_relative_error;
+    state.counters["bytes"] = bm::Counter(iterations * batch_size * query.size_bytes() * 2, bm::Counter::kIsRate);
+    state.counters["pairs"] = bm::Counter(iterations * batch_size, bm::Counter::kIsRate);
     state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
 }
 
@@ -1363,9 +1594,18 @@ int main(int argc, char **argv) {
     dense_<i8_k>("dot_i8_ice", simsimd_dot_i8_ice, simsimd_dot_i8_serial);
     dense_fixed_query_<i8_k>("dot_i8_ice_fixed_query", simsimd_dot_i8_ice, simsimd_dot_i8_serial);
     {
-        std::string bench_name = "fixed_query_i8_dot_i8_by_subtraction<" + std::to_string(dense_dimensions) + "d>";
-        bm::RegisterBenchmark(bench_name.c_str(), measure_fixed_query_i8_dot_i8_by_subtraction, simsimd_dot_i8_serial,
-                              dense_dimensions)
+        std::string bench_name =
+            "dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction<" + std::to_string(dense_dimensions) + "d>";
+        bm::RegisterBenchmark(bench_name.c_str(), measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction,
+                              simsimd_dot_i8_serial, dense_dimensions)
+            ->MinTime(default_seconds)
+            ->Threads(default_threads);
+    }
+    {
+        std::string bench_name =
+            "dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16<" + std::to_string(dense_dimensions) + "d>";
+        bm::RegisterBenchmark(bench_name.c_str(), measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16,
+                              simsimd_dot_i8_serial, dense_dimensions)
             ->MinTime(default_seconds)
             ->Threads(default_threads);
     }
