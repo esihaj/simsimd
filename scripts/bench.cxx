@@ -96,6 +96,50 @@ constexpr std::size_t next_power_of_two(std::size_t n) {
     return n + 1;
 }
 
+constexpr std::size_t divide_round_up(std::size_t numerator, std::size_t denominator) {
+    return (numerator + denominator - 1) / denominator;
+}
+
+constexpr std::uint32_t mix_seed(std::uint32_t seed) noexcept {
+    seed ^= seed >> 16;
+    seed *= 0x7feb352dU;
+    seed ^= seed >> 15;
+    seed *= 0x846ca68bU;
+    seed ^= seed >> 16;
+    return seed;
+}
+
+std::uint32_t benchmark_thread_seed(bm::State const &state, std::uint32_t base_seed) noexcept {
+    std::uint32_t thread_seed = static_cast<std::uint32_t>(state.thread_index()) * 0x9e3779b9U;
+    std::uint32_t group_seed = static_cast<std::uint32_t>(state.threads()) * 0x85ebca6bU;
+    return mix_seed(base_seed ^ thread_seed ^ group_seed);
+}
+
+std::size_t benchmark_thread_working_set_bytes(bm::State const &state, std::size_t vector_bytes) {
+    std::size_t target_bytes = divide_round_up(stream_working_set_bytes, static_cast<std::size_t>(state.threads()));
+    return (std::max)(vector_bytes * std::size_t(1024), target_bytes);
+}
+
+std::size_t benchmark_thread_vector_count(bm::State const &state, std::size_t vector_bytes) {
+    std::size_t target_bytes = benchmark_thread_working_set_bytes(state, vector_bytes);
+    std::size_t target_vectors = divide_round_up(target_bytes, vector_bytes);
+    return next_power_of_two((std::max)(std::size_t(1024), target_vectors));
+}
+
+bm::internal::Benchmark *register_thread_sweep(bm::internal::Benchmark *benchmark) {
+    static constexpr std::array<int, 15> preferred_threads = {1,  2,  3,  4,  6,  8,  10, 12,
+                                                              16, 20, 24, 28, 32, 36, 40};
+
+    int max_threads = static_cast<int>((std::max)(std::thread::hardware_concurrency(), 1u));
+    std::unordered_set<int> registered_threads;
+    for (int threads : preferred_threads) {
+        if (threads > max_threads) break;
+        if (registered_threads.insert(threads).second) benchmark->Threads(threads);
+    }
+    if (registered_threads.insert(max_threads).second) benchmark->Threads(max_threads);
+    return benchmark;
+}
+
 /**
  *  @brief Vector-like fixed capacity buffer, ensuring cache-line alignment.
  *  @tparam datatype_ak The data type of the vector elements, represented as a `simsimd_datatype_t`.
@@ -227,8 +271,7 @@ struct vector_gt {
      */
     void randomize(std::uint32_t seed) noexcept {
 
-        static std::mt19937 generator;
-        generator.seed(seed);
+        std::mt19937 generator(seed);
 
         if constexpr (is_integral) {
             std::uniform_int_distribution<scalar_t> distribution(std::numeric_limits<scalar_t>::min(),
@@ -274,6 +317,39 @@ struct vectors_pair_gt {
         return *this;
     }
 };
+
+inline std::uint64_t next_random_u64(std::uint64_t &state) noexcept {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return state;
+}
+
+void fill_shifted_i8_database(std::vector<simsimd_u8_t> &flat_db, std::size_t vector_stride_bytes,
+                              std::size_t count_scalars,
+                              std::vector<vector_gt<simsimd_datatype_i8_k>> &samples,
+                              std::uint32_t seed) {
+    std::uint64_t state = (static_cast<std::uint64_t>(mix_seed(seed)) << 32) | mix_seed(seed ^ 0xa5a5a5a5U);
+    std::size_t db_count = flat_db.size() / vector_stride_bytes;
+
+    for (std::size_t i = 0; i != db_count; ++i) {
+        simsimd_u8_t *db_vector_shifted = flat_db.data() + i * vector_stride_bytes;
+        simsimd_i8_t *sample_vector = i < samples.size() ? samples[i].data_scalars() : nullptr;
+
+        std::size_t j = 0;
+        for (; j + sizeof(std::uint64_t) <= count_scalars; j += sizeof(std::uint64_t)) {
+            std::uint64_t random_u64 = next_random_u64(state);
+            std::memcpy(db_vector_shifted + j, &random_u64, sizeof(random_u64));
+            if (sample_vector) std::memcpy(sample_vector + j, &random_u64, sizeof(random_u64));
+        }
+        if (j < count_scalars) {
+            std::uint64_t random_u64 = next_random_u64(state);
+            std::memcpy(db_vector_shifted + j, &random_u64, count_scalars - j);
+            if (sample_vector) std::memcpy(sample_vector + j, &random_u64, count_scalars - j);
+        }
+        for (std::size_t k = 0; k != count_scalars; ++k) db_vector_shifted[k] ^= simsimd_u8_t(0x80);
+        if (count_scalars < vector_stride_bytes)
+            std::memset(db_vector_shifted + count_scalars, 0, vector_stride_bytes - count_scalars);
+    }
+}
 
 /**
  *  @brief Measures the performance of a @b dense metric function against a baseline using Google Benchmark.
@@ -705,7 +781,6 @@ void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction(bm::State &state,
                                                              std::size_t dimensions) {
 
     using vector_t = vector_gt<simsimd_datatype_i8_k>;
-    using shifted_vector_t = vector_gt<simsimd_datatype_u8_k>;
 
     auto call_baseline = [&](vector_t const &query, vector_t const &db) -> double {
         simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
@@ -714,32 +789,31 @@ void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction(bm::State &state,
     };
 
     vector_t query(dimensions);
-    query.randomize(0);
+    query.randomize(benchmark_thread_seed(state, 0u));
     dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_gt contender(query.data(), query.size());
 
-    std::size_t db_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / query.size_bytes()));
-    std::vector<vector_t> db_vectors(db_count);
-    std::vector<shifted_vector_t> db_vectors_shifted(db_count);
-    for (std::size_t i = 0; i != db_vectors.size(); ++i) {
-        db_vectors[i] = vector_t(dimensions);
-        db_vectors[i].randomize(static_cast<std::uint32_t>(i) + 54321u);
-        db_vectors_shifted[i] = shifted_vector_t(dimensions);
-        for (std::size_t j = 0; j != db_vectors[i].size_scalars(); ++j)
-            db_vectors_shifted[i].data_scalars()[j] = (simsimd_u8_t)(db_vectors[i].data_scalars()[j] ^ simsimd_i8_t(0x80));
-    }
+    std::size_t vector_bytes = query.size_bytes();
+    std::size_t db_count = benchmark_thread_vector_count(state, vector_bytes);
+    std::size_t thread_working_set_bytes = db_count * vector_bytes;
 
-    std::vector<double> results_baseline((std::min)(db_vectors.size(), std::size_t(128)));
+    std::vector<simsimd_u8_t> flat_db(thread_working_set_bytes);
+    constexpr std::size_t sample_count_k = 128;
+    std::vector<vector_t> db_samples((std::min)(db_count, sample_count_k));
+    for (vector_t &sample : db_samples) sample = vector_t(dimensions);
+    fill_shifted_i8_database(flat_db, vector_bytes, query.size_scalars(), db_samples, benchmark_thread_seed(state, 54321u));
+
+    std::vector<double> results_baseline(db_samples.size());
     std::vector<double> results_contender(results_baseline.size());
     for (std::size_t i = 0; i != results_baseline.size(); ++i) {
-        results_baseline[i] = call_baseline(query, db_vectors[i]);
-        results_contender[i] = contender(db_vectors_shifted[i].data());
+        results_baseline[i] = call_baseline(query, db_samples[i]);
+        results_contender[i] = contender(flat_db.data() + i * vector_bytes);
     }
 
     std::size_t iterations = 0;
     for (auto _ : state) {
         std::size_t index = iterations & (db_count - 1);
         bm::DoNotOptimize((results_contender[iterations & (results_contender.size() - 1)] =
-                               contender(db_vectors_shifted[index].data())));
+                               contender(flat_db.data() + index * vector_bytes)));
         iterations++;
     }
 
@@ -752,11 +826,14 @@ void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction(bm::State &state,
     }
     mean_delta /= results_baseline.size();
     mean_relative_error /= results_baseline.size();
-    state.counters["abs_delta"] = mean_delta;
-    state.counters["relative_error"] = mean_relative_error;
-    state.counters["bytes"] = bm::Counter(iterations * query.size_bytes() * 2, bm::Counter::kIsRate);
-    state.counters["pairs"] = bm::Counter(iterations, bm::Counter::kIsRate);
-    state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
+    state.counters["abs_delta"] = bm::Counter(mean_delta, bm::Counter::kAvgThreads);
+    state.counters["relative_error"] = bm::Counter(mean_relative_error, bm::Counter::kAvgThreads);
+    std::size_t total_threads = static_cast<std::size_t>(state.threads());
+    state.counters["bytes"] = bm::Counter(iterations * vector_bytes * total_threads, bm::Counter::kIsRate);
+    state.counters["pairs"] = bm::Counter(iterations * total_threads, bm::Counter::kIsRate);
+    state.counters["working_set_per_thread"] = bm::Counter(thread_working_set_bytes, bm::Counter::kAvgThreads);
+    state.counters["working_set_total"] =
+        bm::Counter(thread_working_set_bytes * total_threads, bm::Counter::kAvgThreads);
 }
 
 void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16(
@@ -773,29 +850,25 @@ void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16(
     };
 
     vector_t query(dimensions);
-    query.randomize(0);
-    dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16_gt contender(query.data(), query.size(),
-                                                                            query.size_bytes());
+    query.randomize(benchmark_thread_seed(state, 0u));
+    std::size_t vector_bytes = query.size_bytes();
+    dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16_gt contender(query.data(), query.size(), vector_bytes);
 
-    std::size_t db_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / query.size_bytes()));
-    std::vector<vector_t> db_vectors(db_count);
-    std::vector<simsimd_u8_t> flat_db(db_count * query.size_bytes());
-    for (std::size_t i = 0; i != db_vectors.size(); ++i) {
-        db_vectors[i] = vector_t(dimensions);
-        db_vectors[i].randomize(static_cast<std::uint32_t>(i) + 54321u);
-        simsimd_u8_t *flat_db_vector = flat_db.data() + i * query.size_bytes();
-        for (std::size_t j = 0; j != db_vectors[i].size_scalars(); ++j)
-            flat_db_vector[j] = (simsimd_u8_t)(db_vectors[i].data_scalars()[j] ^ simsimd_i8_t(0x80));
-        for (std::size_t j = db_vectors[i].size_scalars(); j != query.size_bytes(); ++j) flat_db_vector[j] = 0;
-    }
+    std::size_t db_count = benchmark_thread_vector_count(state, vector_bytes);
+    std::size_t thread_working_set_bytes = db_count * vector_bytes;
+    std::vector<simsimd_u8_t> flat_db(thread_working_set_bytes);
+    constexpr std::size_t sample_count_k = 128;
+    std::vector<vector_t> db_samples((std::min)(db_count, sample_count_k));
+    for (vector_t &sample : db_samples) sample = vector_t(dimensions);
+    fill_shifted_i8_database(flat_db, vector_bytes, query.size_scalars(), db_samples, benchmark_thread_seed(state, 54321u));
 
-    std::vector<double> results_baseline((std::min)(db_vectors.size(), std::size_t(128)));
+    std::vector<double> results_baseline(db_samples.size());
     std::vector<double> results_contender(results_baseline.size());
-    for (std::size_t i = 0; i != results_baseline.size(); ++i) results_baseline[i] = call_baseline(query, db_vectors[i]);
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) results_baseline[i] = call_baseline(query, db_samples[i]);
 
     for (std::size_t i = 0; i != results_contender.size(); i += batch_size) {
         simsimd_distance_t batch_results[batch_size];
-        contender(flat_db.data() + i * query.size_bytes(), batch_results);
+        contender(flat_db.data() + i * vector_bytes, batch_results);
         for (std::size_t lane = 0; lane != batch_size; ++lane) results_contender[i + lane] = batch_results[lane];
     }
 
@@ -803,7 +876,7 @@ void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16(
     for (auto _ : state) {
         std::size_t base_index = (iterations * batch_size) & (db_count - 1);
         simsimd_distance_t batch_results[batch_size];
-        contender(flat_db.data() + base_index * query.size_bytes(), batch_results);
+        contender(flat_db.data() + base_index * vector_bytes, batch_results);
         for (std::size_t lane = 0; lane != batch_size; ++lane)
             bm::DoNotOptimize((results_contender[(iterations * batch_size + lane) & (results_contender.size() - 1)] =
                                    batch_results[lane]));
@@ -819,11 +892,15 @@ void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16(
     }
     mean_delta /= results_baseline.size();
     mean_relative_error /= results_baseline.size();
-    state.counters["abs_delta"] = mean_delta;
-    state.counters["relative_error"] = mean_relative_error;
-    state.counters["bytes"] = bm::Counter(iterations * batch_size * query.size_bytes() * 2, bm::Counter::kIsRate);
-    state.counters["pairs"] = bm::Counter(iterations * batch_size, bm::Counter::kIsRate);
-    state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
+    state.counters["abs_delta"] = bm::Counter(mean_delta, bm::Counter::kAvgThreads);
+    state.counters["relative_error"] = bm::Counter(mean_relative_error, bm::Counter::kAvgThreads);
+    std::size_t total_threads = static_cast<std::size_t>(state.threads());
+    state.counters["bytes"] =
+        bm::Counter(iterations * batch_size * vector_bytes * total_threads, bm::Counter::kIsRate);
+    state.counters["pairs"] = bm::Counter(iterations * batch_size * total_threads, bm::Counter::kIsRate);
+    state.counters["working_set_per_thread"] = bm::Counter(thread_working_set_bytes, bm::Counter::kAvgThreads);
+    state.counters["working_set_total"] =
+        bm::Counter(thread_working_set_bytes * total_threads, bm::Counter::kAvgThreads);
 }
 
 #pragma clang attribute pop
@@ -1677,18 +1754,20 @@ int main(int argc, char **argv) {
     {
         std::string bench_name =
             "dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction<" + std::to_string(dense_dimensions) + "d>";
-        bm::RegisterBenchmark(bench_name.c_str(), measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction,
-                              simsimd_dot_i8_serial, dense_dimensions)
-            ->MinTime(default_seconds)
-            ->Threads(default_threads);
+        register_thread_sweep(
+            bm::RegisterBenchmark(bench_name.c_str(), measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction,
+                                  simsimd_dot_i8_serial, dense_dimensions)
+                ->MinTime(default_seconds)
+                ->UseRealTime());
     }
     {
         std::string bench_name =
             "dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16<" + std::to_string(dense_dimensions) + "d>";
-        bm::RegisterBenchmark(bench_name.c_str(), measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16,
-                              simsimd_dot_i8_serial, dense_dimensions)
-            ->MinTime(default_seconds)
-            ->Threads(default_threads);
+        register_thread_sweep(
+            bm::RegisterBenchmark(bench_name.c_str(), measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16,
+                                  simsimd_dot_i8_serial, dense_dimensions)
+                ->MinTime(default_seconds)
+                ->UseRealTime());
     }
     dense_stream_<i8_k>("cos_i8_ice_stream", simsimd_cos_i8_ice, simsimd_cos_i8_serial);
     dense_stream_<i8_k>("l2sq_i8_ice_stream", simsimd_l2sq_i8_ice, simsimd_l2sq_i8_serial);
