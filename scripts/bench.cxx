@@ -830,6 +830,87 @@ void measure_dot_i8_ice_fixed_query_i8_dot_i8_by_subtraction_batched16(
 #pragma GCC pop_options
 #endif
 
+#if SIMSIMD_TARGET_SIERRA && defined(__has_builtin) && __has_builtin(__builtin_ia32_vpdpbssd256)
+#pragma GCC push_options
+#pragma GCC target("avx2", "bmi2", "avxvnni", "avxvnniint8")
+#pragma clang attribute push(__attribute__((target("avx2,bmi2,avxvnni,avxvnniint8"))), apply_to = function)
+
+struct dot_i8_sierra_fixed_query_vpdpbssd_64d_gt {
+    static constexpr simsimd_size_t dimensions_k = 64;
+
+    simsimd_i8_t const *query_ = nullptr;
+
+    explicit dot_i8_sierra_fixed_query_vpdpbssd_64d_gt(simsimd_i8_t const *query) noexcept : query_(query) {}
+
+    simsimd_distance_t operator()(simsimd_i8_t const *db) const noexcept {
+        __m256i acc_i32 = _mm256_setzero_si256();
+        __m256i query_low_i8 = _mm256_lddqu_si256((__m256i const *)query_);
+        __m256i query_high_i8 = _mm256_lddqu_si256((__m256i const *)(query_ + 32));
+        __m256i db_low_i8 = _mm256_lddqu_si256((__m256i const *)db);
+        __m256i db_high_i8 = _mm256_lddqu_si256((__m256i const *)(db + 32));
+
+        acc_i32 = _mm256_dpbssd_epi32(acc_i32, query_low_i8, db_low_i8);
+        acc_i32 = _mm256_dpbssd_epi32(acc_i32, query_high_i8, db_high_i8);
+        return (simsimd_distance_t)_simsimd_reduce_i32x8_haswell(acc_i32);
+    }
+};
+
+void measure_dot_i8_sierra_fixed_query_vpdpbssd_64d(bm::State &state, decltype(&simsimd_dot_i8_serial) baseline) {
+
+    using vector_t = vector_gt<simsimd_datatype_i8_k>;
+
+    auto call_baseline = [&](vector_t const &query, vector_t const &db) -> double {
+        simsimd_distance_t results[2] = {signaling_distance, signaling_distance};
+        baseline(query.data(), db.data(), query.size(), &results[0]);
+        return results[0];
+    };
+
+    vector_t query(dot_i8_sierra_fixed_query_vpdpbssd_64d_gt::dimensions_k);
+    query.randomize(0);
+    dot_i8_sierra_fixed_query_vpdpbssd_64d_gt contender(query.data());
+
+    std::size_t db_count = next_power_of_two((std::max)(std::size_t(1024), stream_working_set_bytes / query.size_bytes()));
+    std::vector<vector_t> db_vectors(db_count);
+    for (std::size_t i = 0; i != db_vectors.size(); ++i) {
+        db_vectors[i] = vector_t(dot_i8_sierra_fixed_query_vpdpbssd_64d_gt::dimensions_k);
+        db_vectors[i].randomize(static_cast<std::uint32_t>(i) + 54321u);
+    }
+
+    std::vector<double> results_baseline((std::min)(db_vectors.size(), std::size_t(128)));
+    std::vector<double> results_contender(results_baseline.size());
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        results_baseline[i] = call_baseline(query, db_vectors[i]);
+        results_contender[i] = contender(db_vectors[i].data());
+    }
+
+    std::size_t iterations = 0;
+    for (auto _ : state) {
+        std::size_t index = iterations & (db_count - 1);
+        bm::DoNotOptimize((results_contender[iterations & (results_contender.size() - 1)] =
+                               contender(db_vectors[index].data())));
+        iterations++;
+    }
+
+    double mean_delta = 0, mean_relative_error = 0;
+    for (std::size_t i = 0; i != results_baseline.size(); ++i) {
+        auto abs_delta = std::abs(results_contender[i] - results_baseline[i]);
+        mean_delta += abs_delta;
+        double error = abs_delta != 0 && results_baseline[i] != 0 ? abs_delta / std::abs(results_baseline[i]) : 0;
+        mean_relative_error += error;
+    }
+    mean_delta /= results_baseline.size();
+    mean_relative_error /= results_baseline.size();
+    state.counters["abs_delta"] = mean_delta;
+    state.counters["relative_error"] = mean_relative_error;
+    state.counters["bytes"] = bm::Counter(iterations * query.size_bytes() * 2, bm::Counter::kIsRate);
+    state.counters["pairs"] = bm::Counter(iterations, bm::Counter::kIsRate);
+    state.counters["working_set"] = bm::Counter(db_count * query.size_bytes());
+}
+
+#pragma clang attribute pop
+#pragma GCC pop_options
+#endif
+
 /**
  *  @brief Measures the performance of a @b curved metric function against a baseline using Google Benchmark.
  *  @tparam pair_at The type representing the vector pair used in the measurement.
@@ -1634,6 +1715,13 @@ int main(int argc, char **argv) {
 #if SIMSIMD_TARGET_TURIN
     sparse_<u16_k>("intersect_u16_turin", simsimd_intersect_u16_turin, simsimd_intersect_u16_accurate);
     sparse_<u32_k>("intersect_u32_turin", simsimd_intersect_u32_turin, simsimd_intersect_u32_accurate);
+#endif
+
+#if SIMSIMD_TARGET_SIERRA && defined(__has_builtin) && __has_builtin(__builtin_ia32_vpdpbssd256)
+    bm::RegisterBenchmark("dot_i8_sierra_fixed_query_vpdpbssd<64d>", measure_dot_i8_sierra_fixed_query_vpdpbssd_64d,
+                          simsimd_dot_i8_serial)
+        ->MinTime(default_seconds)
+        ->Threads(default_threads);
 #endif
 
 #if SIMSIMD_TARGET_SKYLAKE
