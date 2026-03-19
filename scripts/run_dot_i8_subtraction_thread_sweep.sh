@@ -17,6 +17,8 @@ run_mlc="1"
 mlc_bin="$root/intel-mlc/mlc"
 skip_build="0"
 run_dir=""
+threads_overridden="0"
+plateau_threads_overridden="0"
 
 usage() {
     cat <<EOF
@@ -70,10 +72,12 @@ while [ $# -gt 0 ]; do
             ;;
         --threads)
             thread_counts="$2"
+            threads_overridden="1"
             shift 2
             ;;
         --plateau-threads)
             plateau_threads="$2"
+            plateau_threads_overridden="1"
             shift 2
             ;;
         --benchmark-min-time)
@@ -112,6 +116,64 @@ while [ $# -gt 0 ]; do
 done
 
 run_dir="${run_dir:-$default_run_dir}"
+
+if [ "$threads_overridden" = "1" ] && [ "$plateau_threads_overridden" != "1" ]; then
+    plateau_threads="$thread_counts"
+fi
+
+available_threads_csv() {
+    local max_threads
+    max_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    local preferred="1,2,3,4,6,8,10,12,16,20,24,28,32,36,40"
+    local result=()
+    local seen=","
+    local thread
+    for thread in ${preferred//,/ }; do
+        if [ "$thread" -le "$max_threads" ]; then
+            result+=("$thread")
+            seen+="$thread,"
+        fi
+    done
+    if [[ "$seen" != *",$max_threads,"* ]]; then
+        result+=("$max_threads")
+    fi
+    local IFS=,
+    echo "${result[*]}"
+}
+
+filter_available_threads() {
+    local requested_csv="$1"
+    local available_csv="$2"
+    local available_lookup=",$available_csv,"
+    local selected=()
+    local missing=()
+    local thread
+    for thread in ${requested_csv//,/ }; do
+        if [[ "$available_lookup" == *",$thread,"* ]]; then
+            selected+=("$thread")
+        else
+            missing+=("$thread")
+        fi
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        printf 'Warning: skipping unsupported thread counts on this host: %s\n' "${missing[*]}" >&2
+    fi
+    if [ "${#selected[@]}" -eq 0 ]; then
+        return 1
+    fi
+    local IFS=,
+    echo "${selected[*]}"
+}
+
+available_threads="$(available_threads_csv)"
+if ! thread_counts="$(filter_available_threads "$thread_counts" "$available_threads")"; then
+    echo "No requested main sweep thread counts are available on this host. Available thread counts: $available_threads" >&2
+    exit 1
+fi
+if [ -n "$plateau_threads" ] && ! plateau_threads="$(filter_available_threads "$plateau_threads" "$available_threads")"; then
+    echo "No requested plateau thread counts are available on this host. Available thread counts: $available_threads" >&2
+    exit 1
+fi
 
 if [ -e "$run_dir" ]; then
     echo "Refusing to overwrite existing path: $run_dir" >&2
