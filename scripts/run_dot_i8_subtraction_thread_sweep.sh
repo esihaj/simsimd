@@ -9,8 +9,8 @@ default_run_dir="$root/benchmark-results/dot-i8-subtraction-$timestamp"
 
 dense_dimensions="64"
 working_set_mib="5120"
-thread_counts="1,2,3,4,6,8,10,12,16,20,24,28,32,36,40"
-plateau_threads="20,24,28,32,40"
+thread_counts=""
+plateau_threads=""
 benchmark_min_time="0.5s"
 plateau_min_time="1s"
 run_mlc="1"
@@ -36,8 +36,8 @@ By default it will:
 Options:
   --dense-dimensions N        Dense dimensions. Default: $dense_dimensions
   --working-set-mib N         Target total working set in MiB. Default: $working_set_mib
-  --threads CSV               Main thread sweep. Default: $thread_counts
-  --plateau-threads CSV       Confirmatory thread sweep. Default: $plateau_threads
+  --threads CSV               Main thread sweep. Default: sparse host-aware sweep up to online CPU count
+  --plateau-threads CSV       Confirmatory thread sweep. Default: last 4 points from main sweep
   --benchmark-min-time TIME   Main sweep min-time. Default: $benchmark_min_time
   --plateau-min-time TIME     Plateau sweep min-time. Default: $plateau_min_time
   --mlc-bin PATH              Path to Intel MLC binary. Default: $mlc_bin
@@ -117,62 +117,45 @@ done
 
 run_dir="${run_dir:-$default_run_dir}"
 
-if [ "$threads_overridden" = "1" ] && [ "$plateau_threads_overridden" != "1" ]; then
-    plateau_threads="$thread_counts"
-fi
-
-available_threads_csv() {
-    local max_threads
-    max_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-    local preferred="1,2,3,4,6,8,10,12,16,20,24,28,32,36,40"
+default_thread_sweep() {
+    local max_threads="$1"
+    local preferred="1,2,3,4,6,8,12,16,24,32,48,64,96,128,192,256"
     local result=()
-    local seen=","
     local thread
     for thread in ${preferred//,/ }; do
         if [ "$thread" -le "$max_threads" ]; then
             result+=("$thread")
-            seen+="$thread,"
         fi
     done
-    if [[ "$seen" != *",$max_threads,"* ]]; then
+    if [ "${#result[@]}" -eq 0 ] || [ "${result[$(( ${#result[@]} - 1 ))]}" -ne "$max_threads" ]; then
         result+=("$max_threads")
     fi
     local IFS=,
     echo "${result[*]}"
 }
 
-filter_available_threads() {
-    local requested_csv="$1"
-    local available_csv="$2"
-    local available_lookup=",$available_csv,"
-    local selected=()
-    local missing=()
-    local thread
-    for thread in ${requested_csv//,/ }; do
-        if [[ "$available_lookup" == *",$thread,"* ]]; then
-            selected+=("$thread")
-        else
-            missing+=("$thread")
-        fi
-    done
-    if [ "${#missing[@]}" -gt 0 ]; then
-        printf 'Warning: skipping unsupported thread counts on this host: %s\n' "${missing[*]}" >&2
+default_plateau_threads() {
+    local csv="$1"
+    local values=(${csv//,/ })
+    local count="${#values[@]}"
+    local start=0
+    if [ "$count" -gt 4 ]; then
+        start=$((count - 4))
     fi
-    if [ "${#selected[@]}" -eq 0 ]; then
-        return 1
-    fi
+    local result=("${values[@]:$start}")
     local IFS=,
-    echo "${selected[*]}"
+    echo "${result[*]}"
 }
 
-available_threads="$(available_threads_csv)"
-if ! thread_counts="$(filter_available_threads "$thread_counts" "$available_threads")"; then
-    echo "No requested main sweep thread counts are available on this host. Available thread counts: $available_threads" >&2
-    exit 1
+max_threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+if [ -z "$thread_counts" ]; then
+    thread_counts="$(default_thread_sweep "$max_threads")"
 fi
-if [ -n "$plateau_threads" ] && ! plateau_threads="$(filter_available_threads "$plateau_threads" "$available_threads")"; then
-    echo "No requested plateau thread counts are available on this host. Available thread counts: $available_threads" >&2
-    exit 1
+if [ -z "$plateau_threads" ]; then
+    plateau_threads="$(default_plateau_threads "$thread_counts")"
+fi
+if [ "$threads_overridden" = "1" ] && [ "$plateau_threads_overridden" != "1" ]; then
+    plateau_threads="$thread_counts"
 fi
 
 if [ -e "$run_dir" ]; then
@@ -226,10 +209,12 @@ run_benchmark() {
     local min_time="$2"
     local json_out="$3"
     local txt_out="$4"
+    local threads_csv="$5"
 
     env \
         SIMSIMD_BENCH_DENSE_DIMENSIONS="$dense_dimensions" \
         SIMSIMD_BENCH_STREAM_WORKING_SET_MIB="$working_set_mib" \
+        SIMSIMD_BENCH_THREADS="$threads_csv" \
         "$binary" \
         --benchmark_filter="$filter" \
         --benchmark_min_time="$min_time" \
@@ -238,10 +223,10 @@ run_benchmark() {
         --benchmark_out_format=json | tee "$txt_out"
 }
 
-run_benchmark "$(thread_filter "$thread_counts")" "$benchmark_min_time" "$thread_sweep_json" "$thread_sweep_txt"
+run_benchmark "$(thread_filter "$thread_counts")" "$benchmark_min_time" "$thread_sweep_json" "$thread_sweep_txt" "$thread_counts"
 
 if [ -n "$plateau_threads" ]; then
-    run_benchmark "$(thread_filter "$plateau_threads")" "$plateau_min_time" "$plateau_json" "$plateau_txt"
+    run_benchmark "$(thread_filter "$plateau_threads")" "$plateau_min_time" "$plateau_json" "$plateau_txt" "$plateau_threads"
 fi
 
 if [ "$run_mlc" = "1" ]; then

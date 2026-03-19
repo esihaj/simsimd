@@ -17,6 +17,7 @@
 #include <cstring>       // `std::memcpy`
 #include <numeric>       // `std::accumulate`
 #include <random>        // `std::uniform_int_distribution`
+#include <string>        // `std::string`
 #include <thread>        // `std::thread`
 #include <tuple>         // `std::tuple` for callable introspection
 #include <type_traits>   // `std::numeric_limits`
@@ -55,6 +56,7 @@ std::size_t curved_dimensions = 8;
 /// Can be overridden at runtime via `SIMSIMD_BENCH_STREAM_WORKING_SET_MIB`
 /// or `SIMSIMD_BENCH_STREAM_WORKING_SET_KIB`, but not both at once.
 std::size_t stream_working_set_bytes = 256 * mebibyte;
+std::vector<int> thread_sweep_override;
 
 namespace bm = benchmark;
 
@@ -126,17 +128,57 @@ std::size_t benchmark_thread_vector_count(bm::State const &state, std::size_t ve
     return next_power_of_two((std::max)(std::size_t(1024), target_vectors));
 }
 
-bm::internal::Benchmark *register_thread_sweep(bm::internal::Benchmark *benchmark) {
-    static constexpr std::array<int, 15> preferred_threads = {1,  2,  3,  4,  6,  8,  10, 12,
-                                                              16, 20, 24, 28, 32, 36, 40};
-
-    int max_threads = static_cast<int>((std::max)(std::thread::hardware_concurrency(), 1u));
-    std::unordered_set<int> registered_threads;
-    for (int threads : preferred_threads) {
-        if (threads > max_threads) break;
-        if (registered_threads.insert(threads).second) benchmark->Threads(threads);
+std::vector<int> default_thread_sweep(int max_threads) {
+    static constexpr std::array<int, 16> preferred_threads = {1,  2,  3,  4,  6,  8,  12, 16,
+                                                              24, 32, 48, 64, 96, 128, 192, 256};
+    std::vector<int> threads;
+    threads.reserve(preferred_threads.size() + 1);
+    for (int candidate : preferred_threads) {
+        if (candidate > max_threads) break;
+        threads.push_back(candidate);
     }
-    if (registered_threads.insert(max_threads).second) benchmark->Threads(max_threads);
+    if (threads.empty() || threads.back() != max_threads) threads.push_back(max_threads);
+    return threads;
+}
+
+bool parse_thread_sweep_override(char const *csv, int max_threads, std::vector<int> &parsed_threads) {
+    std::string input(csv ? csv : "");
+    std::size_t start = 0;
+    std::unordered_set<int> seen;
+    while (start <= input.size()) {
+        std::size_t end = input.find(',', start);
+        std::string token = input.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (token.empty()) {
+            std::fprintf(stderr, "SIMSIMD_BENCH_THREADS contains an empty entry.\n");
+            return false;
+        }
+        char *parse_end = nullptr;
+        long parsed = std::strtol(token.c_str(), &parse_end, 10);
+        if (!parse_end || *parse_end != '\0' || parsed <= 0) {
+            std::fprintf(stderr, "SIMSIMD_BENCH_THREADS contains an invalid thread count: %s\n", token.c_str());
+            return false;
+        }
+        if (parsed > max_threads) {
+            std::fprintf(stderr, "Skipping SIMSIMD_BENCH_THREADS=%ld because it exceeds available threads (%d).\n",
+                         parsed, max_threads);
+        }
+        else if (seen.insert(static_cast<int>(parsed)).second) {
+            parsed_threads.push_back(static_cast<int>(parsed));
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (parsed_threads.empty()) {
+        std::fprintf(stderr, "SIMSIMD_BENCH_THREADS did not contain any usable thread counts.\n");
+        return false;
+    }
+    return true;
+}
+
+bm::internal::Benchmark *register_thread_sweep(bm::internal::Benchmark *benchmark) {
+    int max_threads = static_cast<int>((std::max)(std::thread::hardware_concurrency(), 1u));
+    std::vector<int> threads = thread_sweep_override.empty() ? default_thread_sweep(max_threads) : thread_sweep_override;
+    for (int thread_count : threads) benchmark->Threads(thread_count);
     return benchmark;
 }
 
@@ -1489,6 +1531,11 @@ int main(int argc, char **argv) {
             std::printf("Overriding `stream_working_set_bytes` to %zu KiB from SIMSIMD_BENCH_STREAM_WORKING_SET_KIB\n",
                         parsed_stream_working_set_kib);
         }
+    }
+    if (char const *env_threads = std::getenv("SIMSIMD_BENCH_THREADS")) {
+        int max_threads = static_cast<int>((std::max)(std::thread::hardware_concurrency(), 1u));
+        if (!parse_thread_sweep_override(env_threads, max_threads, thread_sweep_override)) return 1;
+        std::printf("Overriding thread sweep to [%s] from SIMSIMD_BENCH_THREADS\n", env_threads);
     }
     std::printf("\n");
 
